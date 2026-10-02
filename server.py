@@ -73,6 +73,7 @@ import awareness as awareness_mod
 import trustream as trustream_mod
 import ethsig
 import refund as refund_mod
+import btcrail as btc_mod
 
 # Canonical native USDC on Base mainnet (6 decimals), verified against
 # Circle's official docs 2026-09-24. Do not change without Corey's say-so.
@@ -131,6 +132,12 @@ SOLANA_NETWORK = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"
 SOL_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"  # 6 decimals
 SOL_SIG_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{87,88}$")
 
+# Bitcoin rail: native BTC on mainnet. CAIP-2 uses the genesis block hash;
+# the asset follows CAIP-19 (slip44:0 = native BTC).
+BITCOIN_NETWORK = "bip122:000000000019d6689c085ae165831e934"
+BITCOIN_ASSET = "bip122:000000000019d6689c085ae165831e934/slip44:0"
+BTC_TXID_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
 
 def _rail_rpcs(rail):
     urls = [u.strip() for u in os.environ.get(rail["rpc_env"], "").split(",")
@@ -147,12 +154,17 @@ def _rail_info():
         info.append({"network": SOLANA_NETWORK, "label": "Solana",
                      "asset": SOL_USDC_MINT, "payTo": PAY_TO_SOL,
                      "kind": "solana"})
+    if PAY_TO_BTC:
+        info.append({"network": BITCOIN_NETWORK, "label": "Bitcoin",
+                     "asset": BITCOIN_ASSET, "payTo": PAY_TO_BTC,
+                     "kind": "bitcoin"})
     return info
 
 SRV_DIR = os.environ.get("SRV_DIR", "/srv")
 PORT = int(os.environ.get("PORT", "8080"))
 PAY_TO = os.environ.get("X402_PAY_TO", "").strip()
 PAY_TO_SOL = os.environ.get("X402_PAY_TO_SOL", "").strip()
+PAY_TO_BTC = os.environ.get("X402_PAY_TO_BTC", "").strip()
 RPC_URLS = [u.strip() for u in os.environ.get("X402_RPC_URLS", "").split(",")
             if u.strip()]
 SOLANA_RPC_URLS = [u.strip()
@@ -533,11 +545,81 @@ def _verify_solana(sig, min_units, used_set, rpc=None):
     return True, {"paid_units": paid, "tx": sig, "network": SOLANA_NETWORK}
 
 
+def _verify_bitcoin(txid, min_sats, used_set, payer_sig=None, resource=None):
+    """Verify a native-BTC payment on Bitcoin mainnet.
+
+    The tx must be confirmed, must pay >= min_sats to PAY_TO_BTC, and
+    payer_sig must be a Bitcoin signed message over
+    ethsig.binding_message(txid, resource) that recovers to one of the
+    funding input addresses (front-running protection, same role as
+    payerSig on EVM).
+    """
+    h = (txid or "").strip().lower()
+    key = "btc:" + h
+    if not BTC_TXID_RE.fullmatch(h or ""):
+        return False, {"reason": "bad txid format (want 64 hex chars)"}
+    if key in used_set:
+        return False, {"reason": "replay: txid already used"}
+    try:
+        tx = btc_mod.fetch_btc_tx(h)
+    except Exception as e:  # noqa: BLE001 - surfaced as clean failure
+        return False, {"reason": "bitcoin API unreachable: %s" % str(e)[:120]}
+    status = tx.get("status") or {}
+    if not status.get("confirmed"):
+        return False, {"reason": "tx not confirmed yet — wait for 1 confirmation"}
+    min_confs = int(os.environ.get("X402_BTC_MIN_CONFS", "1") or 1)
+    if min_confs > 1:
+        try:
+            tip = btc_mod._btc_get_text("/blocks/tip/height")
+            confs = int(tip) - int(status.get("block_height") or 0) + 1
+        except Exception:
+            confs = 1
+        if confs < min_confs:
+            return False, {"reason": "tx has %d confirmation(s), need %d"
+                           % (confs, min_confs)}
+    paid = 0
+    for vout in tx.get("vout") or []:
+        if not isinstance(vout, dict):
+            continue
+        if (vout.get("scriptpubkey_address") or "") == PAY_TO_BTC:
+            try:
+                paid += int(vout.get("value") or 0)
+            except (ValueError, TypeError):
+                pass
+    if paid < min_sats:
+        return False, {"reason": "underpaid: got %d sats, need %d"
+                       % (paid, min_sats),
+                       "paid_units": paid}
+    if not payer_sig:
+        return False, {"reason": "missing payerSig: bind the proof with a "
+                                 "Bitcoin signed message by a funding input "
+                                 "address (see extra.howto)"}
+    senders = set()
+    for vin in tx.get("vin") or []:
+        if not isinstance(vin, dict):
+            continue
+        a = (vin.get("prevout") or {}).get("scriptpubkey_address")
+        if a:
+            senders.add(a)
+    if not senders:
+        return False, {"reason": "could not read funding inputs"}
+    msg = ethsig.binding_message(h, resource or "")
+    if not any(btc_mod.verify_btc_message(msg, payer_sig, a) for a in senders):
+        return False, {"reason": "payerSig does not match any funding input "
+                                 "address (P2WPKH/P2PKH only)"}
+    used_set.add(key)
+    return True, {"paid_units": paid, "tx": h, "network": BITCOIN_NETWORK}
+
+
 def verify_payment(proof, network, min_units, used_set, rpc=None,
                    payer_sig=None, resource=None):
     """Returns (ok, info). On success the namespaced proof is added to used_set."""
     if network == SOLANA_NETWORK:
         return _verify_solana(proof, min_units, used_set, rpc)
+    if network == BITCOIN_NETWORK:
+        # min_units arrives in USDC base units; BTC prices in sats.
+        min_sats = btc_mod.sats_for_cents(min_units / UNITS_PER_CENT)
+        return _verify_bitcoin(proof, min_sats, used_set, payer_sig, resource)
     rail = EVM_RAILS.get(network)
     if not rail:
         return False, {"reason": "unsupported network %r" % (network,)}
@@ -849,6 +931,46 @@ def payment_requirements(product, op, host, reason=None):
                              json.dumps(SOLANA_NETWORK))),
             },
         })
+    if PAY_TO_BTC:
+        # BTC is priced live (sats, rounded up). If the price feed is down
+        # the rail is skipped for this challenge rather than mispriced.
+        try:
+            btc_price = btc_mod.btc_usd_price()
+            btc_sats = btc_mod.sats_for_cents(cents, btc_price)
+        except Exception:
+            btc_price, btc_sats = 0.0, 0
+        if btc_sats:
+            accepts.append({
+                "scheme": PAY_SCHEME,
+                "network": BITCOIN_NETWORK,
+                "amount": str(btc_sats),
+                "asset": BITCOIN_ASSET,
+                "payTo": PAY_TO_BTC,
+                "resource": resource,
+                "description": ("Slid Phi Labs %s %s — %d¢ in native BTC "
+                                "on Bitcoin mainnet per call "
+                                "(%d sats @ $%.2f/BTC)"
+                                % (product, op, cents, btc_sats, btc_price)),
+                "mimeType": "application/json",
+                "maxTimeoutSeconds": 600,
+                "extra": {
+                    "paymentProof": "txid",
+                    "btc_usd": btc_price,
+                    "howto": ("1) send >= %d sats native BTC on Bitcoin "
+                              "mainnet to %s (fees are on you and will "
+                              "exceed this micro-payment)  2) sign this "
+                              "EXACT text with the paying address (Bitcoin "
+                              "signed message):\nrider-x402 payment proof\\n"
+                              "txHash: <your txid, lowercase>\\nresource: %s "
+                              "3) wait for 1 confirmation, then retry with "
+                              "X-PAYMENT: base64url(JSON({\"x402Version\":2,"
+                              "\"scheme\":\"txHash\",\"network\":%s,"
+                              "\"payload\":{\"txid\":\"...\","
+                              "\"payerSig\":\"<base64>\"}}))"
+                              % (btc_sats, PAY_TO_BTC, resource,
+                                 json.dumps(BITCOIN_NETWORK))),
+                },
+            })
     body = {
         "x402Version": X402_VERSION,
         "error": ("payment required: pay %d¢ USDC on a supported rail, "
@@ -923,9 +1045,23 @@ def parse_x_payment(header_value):
         if not sig:
             return None, None, None, "X-PAYMENT payload needs payload.signature"
         return sig, net, None, None
+    if net == BITCOIN_NETWORK:
+        if not PAY_TO_BTC:
+            return None, None, None, "Bitcoin rail not enabled on this server"
+        txid = inner.get("txid") or inner.get("txHash") or inner.get("tx_hash")
+        if not txid:
+            return None, None, None, "X-PAYMENT payload needs payload.txid"
+        psig = inner.get("payerSig") or inner.get("payer_sig")
+        if not psig:
+            return None, None, None, (
+                "X-PAYMENT payload needs payload.payerSig: base64 Bitcoin "
+                "signed message by a funding input address over the binding "
+                "message shown in extra.howto.")
+        return txid, net, psig, None
     return None, None, None, ("unsupported network %r (supported: %s)"
                         % (net, ", ".join(list(EVM_RAILS) +
-                                          ([SOLANA_NETWORK] if PAY_TO_SOL else []))))
+                                          ([SOLANA_NETWORK] if PAY_TO_SOL else []) +
+                                          ([BITCOIN_NETWORK] if PAY_TO_BTC else []))))
 
 
 # --------------------------------------------------------------------------
@@ -1158,7 +1294,8 @@ def _well_known():
             eps["/api/x402/%s/%s" % (pr, op)] = {
                 "cents_usdc": cents,
                 "networks": (list(EVM_RAILS) +
-                             ([SOLANA_NETWORK] if PAY_TO_SOL else [])),
+                             ([SOLANA_NETWORK] if PAY_TO_SOL else []) +
+                             ([BITCOIN_NETWORK] if PAY_TO_BTC else [])),
                 "scheme": PAY_SCHEME,
                 "x402Version": X402_VERSION,
             }
@@ -1351,7 +1488,9 @@ class Handler(BaseHTTPRequestHandler):
                         "network": info.get("network", net)}).encode()).decode()}
         return self._send(200, {"ok": True, "product": product, "op": op,
                                 "charged_cents": cents,
-                                "charged_units": cents * UNITS_PER_CENT,
+                                "charged_units": (btc_mod.sats_for_cents(cents)
+                                                  if net == BITCOIN_NETWORK
+                                                  else cents * UNITS_PER_CENT),
                                 "tx": info["tx"], "result": result},
                           resp_h)
 
@@ -1361,6 +1500,8 @@ def main():
         raise SystemExit("X402_PAY_TO env required")
     if not RPC_URLS:
         raise SystemExit("X402_RPC_URLS env required")
+    if PAY_TO_BTC and not btc_mod.is_valid_btc_address(PAY_TO_BTC):
+        raise SystemExit("X402_PAY_TO_BTC is not a valid Bitcoin address")
     os.makedirs(os.path.join(SRV_DIR, "bin"), exist_ok=True)
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print("rider-x402 listening on :%d (pay_to=%s)" % (PORT, PAY_TO), flush=True)
@@ -1368,6 +1509,9 @@ def main():
                                   for r in _rail_info()), flush=True)
     if not PAY_TO_SOL:
         print("note: X402_PAY_TO_SOL unset — Solana rail not advertised",
+              flush=True)
+    if not PAY_TO_BTC:
+        print("note: X402_PAY_TO_BTC unset — Bitcoin rail not advertised",
               flush=True)
     srv.serve_forever()
 
