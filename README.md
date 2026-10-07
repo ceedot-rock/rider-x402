@@ -1,5 +1,8 @@
 # rider-x402
 
+[![Audited checks](https://github.com/ceedot-rock/rider-x402/actions/workflows/audited-checks.yml/badge.svg)](https://github.com/ceedot-rock/rider-x402/actions/workflows/audited-checks.yml)
+[![License: AGPL-3.0-or-later / Commercial](https://img.shields.io/badge/license-AGPL--3.0--or--later%20%2F%20commercial-blue.svg)](LICENSE)
+
 ## What x402 is
 
 x402 is the open payment protocol the lab's paid endpoints speak — and the way AI agents pay for things. It works like a vending machine for the web: you ask for something, the machine tells you the price, you pay, it vends.
