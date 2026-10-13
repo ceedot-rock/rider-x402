@@ -21,3 +21,23 @@ verified on-chain (Base USDC), replay-protected.
 Products: ping (1c); pcc/slidx compress (25c), decompress (10c), info (2c);
 cuni check (10c), seats (2c), emit (25c), ingest (25c);
 trustream pack/unpack (10c), info (2c); awareness/scan (10c).
+
+### Lab free-use pass
+
+The lab's own wallets don't pay per call for internal use (benchmarking,
+demos, dogfooding). Set `LAB_WALLETS` to a comma-separated list of the
+lab's paying addresses:
+
+```
+fly secrets set LAB_WALLETS=0xabc...,0xdef... -a rider-x402
+```
+
+Allowlisted callers send `X-PAYER: <their address>` and get a **$0** 402
+quote — but the x402 flow still runs end to end: a real (0-value) USDC
+transfer to the lab wallet plus a `payerSig` from the allowlisted address,
+verified on-chain exactly like a paid call. The claim in `X-PAYER` is never
+trusted on its own — spoofing it only gets you a $0 quote you can't
+complete without the lab's private key. Lab calls are logged with
+`lab_free: true` and the recovered payer address, so volume monitoring
+keeps working. With `LAB_WALLETS` unset, pricing is byte-identical to
+before; malformed entries in the list are ignored.

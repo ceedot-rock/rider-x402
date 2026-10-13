@@ -46,6 +46,16 @@ Env:
                     Helius, Alchemy.
     PORT            listen port (default 8080)
     SRV_DIR         persistent dir (default /srv)
+    LAB_WALLETS     comma-separated EIP-55 addresses (0x...) that get a free
+                    lab pass: their calls price at $0 but still run the full
+                    x402 proof flow (real tx + payerSig binding + ledger), so
+                    the lab dogfoods the real path. Lab calls are logged with
+                    lab_free=true. Unset (default): everyone pays list price.
+                    Malformed entries are ignored. Callers announce
+                    themselves with an X-PAYER header carrying their paying
+                    address; the header only selects the $0 quote — the
+                    payerSig at verify time must still come from the
+                    allowlisted address, so spoofing it buys nothing.
 
 Rails accepted (mainnet only, no testnets):
     Base eip155:8453, Polygon eip155:137, Arbitrum One eip155:42161,
@@ -165,6 +175,47 @@ PORT = int(os.environ.get("PORT", "8080"))
 PAY_TO = os.environ.get("X402_PAY_TO", "").strip()
 PAY_TO_SOL = os.environ.get("X402_PAY_TO_SOL", "").strip()
 PAY_TO_BTC = os.environ.get("X402_PAY_TO_BTC", "").strip()
+
+
+def parse_lab_wallets(raw):
+    """Comma-separated addresses -> frozenset of lowercase addresses.
+
+    Only well-formed 0x + 40 hex addresses are kept; malformed entries
+    are ignored so a bad secret can never crash the server or widen the
+    pass. Matching is case-insensitive (EIP-55 checksum not enforced).
+    """
+    out = set()
+    for piece in (raw or "").split(","):
+        a = piece.strip()
+        if re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
+            out.add(a.lower())
+    return frozenset(out)
+
+
+LAB_WALLETS = parse_lab_wallets(os.environ.get("LAB_WALLETS", ""))
+
+
+def is_lab_wallet(addr):
+    """True when the recovered payer is on the lab free-use pass."""
+    return bool(LAB_WALLETS) and (addr or "").strip().lower() in LAB_WALLETS
+
+
+def lab_payer_claim(headers):
+    """Optional X-PAYER header: caller states its paying address up front
+    so the 402 challenge itself can quote $0.
+
+    The claim is NOT trusted for payment. verify_payment still requires a
+    real mined tx with a USDC Transfer to PAY_TO plus a payerSig from the
+    allowlisted address — spoofing this header only gets you a $0 quote
+    you cannot complete. Returns the lowercase address or None.
+    """
+    if not LAB_WALLETS:
+        return None
+    claimed = (headers.get("X-PAYER") or "").strip()
+    if re.fullmatch(r"0x[0-9a-fA-F]{40}", claimed) \
+            and claimed.lower() in LAB_WALLETS:
+        return claimed.lower()
+    return None
 RPC_URLS = [u.strip() for u in os.environ.get("X402_RPC_URLS", "").split(",")
             if u.strip()]
 SOLANA_RPC_URLS = [u.strip()
@@ -489,14 +540,23 @@ def _verify_evm(tx_hash, network, rail, min_units, used_set, rpc=None,
     if not sig_ok:
         return False, {"reason": sig_reason}
     paid = _sum_usdc_to(receipt, PAY_TO, rail["usdc"])
-    if paid < min_units:
+    # Lab free-use pass: the recovered payer is on LAB_WALLETS, so the
+    # call prices at $0. Everything above is still fully verified — real
+    # mined tx, USDC Transfer to PAY_TO (a 0-value self-transfer counts),
+    # payerSig bound to the allowlisted address — so the lab dogfoods the
+    # real x402 path. With LAB_WALLETS unset this branch is dead code.
+    lab_free = is_lab_wallet(payer)
+    need = 0 if lab_free else min_units
+    if paid < need:
         return False, {"reason": "underpaid: got %.6f USDC, need %.6f"
                                  % (paid / 10 ** USDC_DECIMALS,
-                                    min_units / 10 ** USDC_DECIMALS),
+                                    need / 10 ** USDC_DECIMALS),
                        "paid_units": paid}
     used_set.add(key)
-    return True, {"paid_units": paid, "tx": h, "network": network,
-                  "payer": payer}
+    info = {"paid_units": paid, "tx": h, "network": network, "payer": payer}
+    if lab_free:
+        info["lab_free"] = True
+    return True, info
 
 
 def _sol_get_tx(call, sig):
@@ -886,8 +946,12 @@ def _evm_howto(cents, rail, net, resource):
             % (cents, rail["label"], PAY_TO, resource, json.dumps(net)))
 
 
-def payment_requirements(product, op, host, reason=None):
+def payment_requirements(product, op, host, reason=None, lab_free=False):
     cents = PRODUCTS[product][op]
+    # Lab free-use pass: the 402 quotes $0. The x402 fields stay valid —
+    # only the amount is zeroed, so lab clients still run the real flow.
+    if lab_free:
+        cents = 0
     units = cents * UNITS_PER_CENT
     resource = "https://%s/api/x402/%s/%s" % (host, product, op)
     accepts = []
@@ -931,9 +995,11 @@ def payment_requirements(product, op, host, reason=None):
                              json.dumps(SOLANA_NETWORK))),
             },
         })
-    if PAY_TO_BTC:
+    if PAY_TO_BTC and not lab_free:
         # BTC is priced live (sats, rounded up). If the price feed is down
         # the rail is skipped for this challenge rather than mispriced.
+        # Lab free-use quotes skip it too (the pass is EVM-only; a $0
+        # quote must not advertise a 1-sat minimum).
         try:
             btc_price = btc_mod.btc_usd_price()
             btc_sats = btc_mod.sats_for_cents(cents, btc_price)
@@ -973,23 +1039,28 @@ def payment_requirements(product, op, host, reason=None):
             })
     body = {
         "x402Version": X402_VERSION,
-        "error": ("payment required: pay %d¢ USDC on a supported rail, "
+        "error": ("lab free pass: submit a $0 USDC proof with X-PAYMENT, "
+                  "then retry" if lab_free else
+                  "payment required: pay %d¢ USDC on a supported rail, "
                   "then retry with X-PAYMENT" % cents),
         "accepts": accepts,
         "extensions": {
             "refund": refund_mod.refund_extension_info(host),
         },
     }
+    if lab_free:
+        body["labFree"] = True
     if reason:
         body["reason"] = reason
     return body
 
 
-def payment_required_header(product, op, host, reason=None):
+def payment_required_header(product, op, host, reason=None, lab_free=False):
     """Value for the PAYMENT-REQUIRED header: base64url of the v2
     PaymentRequirements object, so standard x402 clients can read terms
     straight from the header without parsing the body."""
-    req = payment_requirements(product, op, host, reason)
+    req = payment_requirements(product, op, host, reason,
+                               lab_free=lab_free)
     return base64.urlsafe_b64encode(json.dumps(req).encode()).decode("ascii")
 
 
@@ -1381,11 +1452,15 @@ class Handler(BaseHTTPRequestHandler):
         if m and m.group(1) in PRODUCTS and m.group(2) in PRODUCTS[m.group(1)]:
             # Paid route over GET: answer 402 with the terms, so scanners
             # and indexers see a live payment gate instead of a dead host.
+            # Lab wallets announcing via X-PAYER get the $0 quote here too.
             product, op = m.group(1), m.group(2)
             host = self.headers.get("Host", "rider-x402.fly.dev")
-            return self._send(402, payment_requirements(product, op, host),
+            lab_quote = lab_payer_claim(self.headers) is not None
+            return self._send(402, payment_requirements(product, op, host,
+                                                        lab_free=lab_quote),
                               {"PAYMENT-REQUIRED":
-                               payment_required_header(product, op, host)},
+                               payment_required_header(product, op, host,
+                                                       lab_free=lab_quote)},
                               head_only=head_only)
         return self._send(404, {"error": "not found"}, head_only=head_only)
 
@@ -1429,15 +1504,25 @@ class Handler(BaseHTTPRequestHandler):
 
         # ---- payment gate ----
         host = self.headers.get("Host", "rider-x402.fly.dev")
+        # Lab free-use pass: an allowlisted X-PAYER claim selects the $0
+        # quote on every 402 below. The claim is not trusted for payment —
+        # verify_payment still recovers the payer from the tx + payerSig
+        # and only zeroes the price when they match the allowlist.
+        lab_claim = lab_payer_claim(self.headers)
+        lab_quote = lab_claim is not None
+        if lab_claim:
+            entry["lab_claim"] = lab_claim
         proof, net, payer_sig, perr = parse_x_payment(self.headers.get("X-PAYMENT"))
         if perr:
             entry.update(ok=False, error="402: " + perr)
             log_call(entry)
             return self._send(402, payment_requirements(product, op, host,
-                                                        reason=perr),
+                                                        reason=perr,
+                                                        lab_free=lab_quote),
                               {"PAYMENT-REQUIRED":
                                payment_required_header(product, op, host,
-                                                       reason=perr)})
+                                                       reason=perr,
+                                                       lab_free=lab_quote)})
         entry["network"] = net
         resource = "https://%s/api/x402/%s/%s" % (host, product, op)
         with _state_lock:
@@ -1452,11 +1537,19 @@ class Handler(BaseHTTPRequestHandler):
             entry.update(ok=False, error="402: " + vreason)
             log_call(entry)
             return self._send(402, payment_requirements(product, op, host,
-                                                        reason=vreason),
+                                                        reason=vreason,
+                                                        lab_free=lab_quote),
                               {"PAYMENT-REQUIRED":
                                payment_required_header(product, op, host,
-                                                       reason=vreason)})
+                                                       reason=vreason,
+                                                       lab_free=lab_quote)})
         entry.update(paid_units=info["paid_units"], tx=info["tx"])
+        # Lab free-use pass, confirmed: the recovered payer (not just the
+        # X-PAYER claim) is allowlisted. Mark it clearly in the audit log
+        # so lab volume stays metered and distinguishable.
+        lab_free = bool(info.get("lab_free"))
+        if lab_free:
+            entry.update(lab_free=True, payer=info.get("payer"))
 
         # ---- run product ----
         data = None
@@ -1486,13 +1579,18 @@ class Handler(BaseHTTPRequestHandler):
             json.dumps({"x402Version": X402_VERSION, "success": True,
                         "transaction": info["tx"],
                         "network": info.get("network", net)}).encode()).decode()}
-        return self._send(200, {"ok": True, "product": product, "op": op,
-                                "charged_cents": cents,
-                                "charged_units": (btc_mod.sats_for_cents(cents)
-                                                  if net == BITCOIN_NETWORK
-                                                  else cents * UNITS_PER_CENT),
-                                "tx": info["tx"], "result": result},
-                          resp_h)
+        charged_cents = 0 if lab_free else cents
+        charged_units = (0 if lab_free else
+                         (btc_mod.sats_for_cents(cents)
+                          if net == BITCOIN_NETWORK
+                          else cents * UNITS_PER_CENT))
+        resp_body = {"ok": True, "product": product, "op": op,
+                     "charged_cents": charged_cents,
+                     "charged_units": charged_units,
+                     "tx": info["tx"], "result": result}
+        if lab_free:
+            resp_body["lab_free"] = True
+        return self._send(200, resp_body, resp_h)
 
 
 def main():
