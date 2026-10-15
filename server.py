@@ -1276,7 +1276,16 @@ OPENAPI = {
 def _build_openapi_paths():
     paths = {
         "/": {"get": {"summary": "Service info",
+                      "description": ("JSON info document by default; "
+                                      "Accept: text/html serves the human "
+                                      "landing page (content negotiation)."),
                       "responses": {"200": {"description": "info"}}}},
+        "/robots.txt": {"get": {"summary": "Crawl policy (points crawlers "
+                                            "and agents to /llms.txt)",
+                                "responses": {"200": {"description": "text"}}}},
+        "/llms.txt": {"get": {"summary": "Agent-readable endpoint + x402 "
+                                          "flow summary",
+                              "responses": {"200": {"description": "text"}}}},
         "/health": {"get": {"summary": "Health check",
                             "responses": {"200": {"description": "ok"}}}},
         "/api/x402/prices": {"get": {"summary": "Price table (free)",
@@ -1357,6 +1366,153 @@ def _build_openapi_paths():
 OPENAPI["paths"] = _build_openapi_paths()
 
 
+# --------------------------------------------------------------------------
+# human landing page + agent discoverability files
+# --------------------------------------------------------------------------
+
+def _accepts_html(headers):
+    """True when the client is a browser (or any client that asks for HTML).
+
+    curl/default (no Accept or */*) keeps getting the JSON info document,
+    so machine clients never change behavior.
+    """
+    return "text/html" in headers.get("Accept", "").lower()
+
+
+def _landing_html(host):
+    """Human-readable product page served at / for browsers."""
+    base = "https://%s" % host
+    page = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCC &mdash; Hosted Lossless Compression &middot; Slid Phi Labs</title>
+<meta name="description" content="PCC is hosted lossless compression, the ratio king: 12 encoding strategies tried per file, smallest kept. Pay per call in USDC via x402 v2.">
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;max-width:46rem;margin:0 auto;padding:2rem 1.25rem;line-height:1.6;color:#1a1a1a}
+@media (prefers-color-scheme:dark){body{color:#e8e8e8;background:#101010}}
+h1{font-size:2.1rem;margin:0}
+.sub{margin:.2rem 0 1.5rem;color:#555}
+@media (prefers-color-scheme:dark){.sub{color:#aaa}}
+.badge{display:inline-block;background:#0a6e39;color:#fff;border-radius:.3rem;padding:.05rem .5rem;font-size:.85rem;vertical-align:middle}
+table{border-collapse:collapse;margin:1rem 0;width:100%}
+th,td{border:1px solid #c9c9c9;padding:.4rem .7rem;text-align:left}
+@media (prefers-color-scheme:dark){th,td{border-color:#444}}
+code{background:#f0f0f0;padding:.08rem .35rem;border-radius:.25rem;font-size:.88em}
+@media (prefers-color-scheme:dark){code{background:#242424}}
+ol.steps li{margin:.55rem 0}
+a{color:#0a6fd0}
+small{color:#777}
+</style>
+</head>
+<body>
+<h1>PCC <span class="badge">hosted</span></h1>
+<p class="sub">Lossless compression as a paid API &middot; <strong>the ratio king</strong> &middot; by <a href="https://www.slidphilabs.com/pcc">Slid Phi Labs</a></p>
+
+<h2>What it is</h2>
+<p>PCC tries <strong>12 encoding strategies</strong> on every file and keeps the smallest. Every decode is verified bit-identical (SHA-256 of input and output is checked on each call), and random data passes through without expansion &mdash; the exactness gate holds.</p>
+<p>Measured ratios (2026-10-14, 500&nbsp;KB files), compressed size as % of input:</p>
+<table>
+<tr><th>Data</th><th>PCC</th><th>gzip&nbsp;-6</th></tr>
+<tr><td>Text</td><td><strong>4.4%</strong></td><td>16.3%</td></tr>
+<tr><td>JSON</td><td><strong>3.7%</strong></td><td>8.1%</td></tr>
+<tr><td>Code</td><td><strong>0.2%</strong></td><td>0.3%</td></tr>
+<tr><td>Ramp (int32)</td><td><strong>0.7%</strong></td><td>1.0%</td></tr>
+</table>
+<p>The honest tradeoff: PCC wins on <strong>ratio</strong>, not on speed (encode runs 0.26&ndash;24&nbsp;MB/s). It is the archival / bandwidth play &mdash; if latency matters, the lab's speed tier is the tool for that job.</p>
+
+<h2>Pricing</h2>
+<p>Per call, in native USDC via x402&nbsp;v2. No account, no API key &mdash; each call carries its own payment.</p>
+<table>
+<tr><th>Endpoint</th><th>Price</th></tr>
+<tr><td><code>POST /api/x402/pcc/info</code></td><td>2&cent;</td></tr>
+<tr><td><code>POST /api/x402/pcc/decompress</code></td><td>10&cent;</td></tr>
+<tr><td><code>POST /api/x402/pcc/compress</code></td><td>25&cent;</td></tr>
+</table>
+<p>Accepted rails: native USDC on <strong>Base</strong>, <strong>Polygon</strong>, <strong>Arbitrum One</strong>, <strong>Optimism</strong>, and <strong>Solana</strong>. (A native-BTC rail exists too &mdash; the 402 terms list every live rail.)</p>
+
+<h2>How to use it</h2>
+<ol class="steps">
+<li><strong>Call without payment.</strong> You get <code>402 Payment Required</code> with machine-readable terms &mdash; plus a plain-English <code>howto</code> field telling you exactly what to sign.</li>
+<li><strong>Pay.</strong> Transfer at least the stated amount of native USDC on the chosen network to the <code>payTo</code> address.</li>
+<li><strong>Sign the proof.</strong> Sign the exact text from the 402's <code>howto</code> with the paying address (EIP-191 <code>personal_sign</code>; contract wallets verify via ERC-1271).</li>
+<li><strong>Retry with the header.</strong> Repeat the request with <code>X-PAYMENT</code>: base64url of <code>{"x402Version":2,"scheme":"txHash","network":"eip155:8453","payload":{"txHash":"0x&hellip;","payerSig":"0x&hellip;"}}</code>.</li>
+<li><strong>Mind the clock.</strong> Payment must complete within 300 seconds of the 402.</li>
+</ol>
+<p>One payment, one call &mdash; the signed proof is bound to the endpoint URL and cannot be replayed elsewhere. Request bodies are <code>{"data": "&lt;base64 bytes&gt;"}</code>; responses carry <code>payload_b64</code> plus SHA-256 digests of input and output.</p>
+
+<h2>For agents</h2>
+<p>This root answers JSON by default &mdash; machine clients: nothing changes. For agents: <code>/llms.txt</code> lists every endpoint with pricing and the x402 flow in plain text; <code>/openapi.json</code> is the machine spec; <code>/.well-known/x402</code> is the indexer listing. <a href="{BASE}/api/x402/prices">Live price table</a>.</p>
+
+<h2>Links</h2>
+<ul>
+<li><a href="https://www.slidphilabs.com/pcc">slidphilabs.com/pcc</a> &mdash; the PCC product page</li>
+<li><a href="{BASE}/openapi.json">OpenAPI spec</a></li>
+<li><a href="{BASE}/api/x402/prices">Live prices</a></li>
+<li><a href="{BASE}/.well-known/x402">x402 indexer listing</a></li>
+</ul>
+<hr>
+<p><small>Numbers above were measured 2026-10-14 on 500&nbsp;KB files; the 402 response is always the source of truth for live terms. PCC is a product of Slid Phi Labs.</small></p>
+</body>
+</html>
+"""
+    return page.replace("{BASE}", base)
+
+
+def _robots_txt(host):
+    return ("User-agent: *\n"
+            "Allow: /\n\n"
+            "# Agent-readable API summary for this x402 service:\n"
+            "# https://%s/llms.txt\n" % host)
+
+
+def _llms_txt(host):
+    return """# rider-x402 — Slid Phi Labs x402 paid API
+
+Hosted lossless compression (PCC, the ratio king) plus sibling lab products,
+metered per call in native USDC via x402 v2. No accounts, no API keys — each
+call carries its own payment.
+
+Base URL: https://%s
+
+## PCC endpoints
+- POST /api/x402/pcc/info — 2c — codec info
+- POST /api/x402/pcc/compress — 25c — body {"data":"<base64 bytes>"} ->
+  {"payload_b64":"<base64>","in_bytes":N,"out_bytes":M,"sha256_in":..,"sha256_out":..}
+- POST /api/x402/pcc/decompress — 10c — same shape, exact inverse of compress
+
+Other products (prices per call): ping, slidx, cuni, trustream, awareness.
+See /api/x402/prices for the live table.
+
+## x402 payment flow
+1. POST the endpoint without payment -> 402 with PaymentRequirements:
+   network, amount (base units), USDC asset address, payTo, and a
+   plain-English howto field naming the exact text to sign.
+2. Transfer >= the stated amount of native USDC on that network to payTo.
+3. Sign the exact proof text with the paying address (EIP-191 personal_sign;
+   contract wallets verify via ERC-1271).
+4. Retry with header X-PAYMENT: base64url of
+   {"x402Version":2,"scheme":"txHash","network":"<caip2>",
+    "payload":{"txHash":"0x..","payerSig":"0x.."}}.
+   Solana: {"payload":{"signature":"<base58>"}}.
+5. Payment must complete within 300 seconds of the 402. One payment = one
+   call; the proof is bound to the endpoint URL and cannot be replayed.
+
+## PCC positioning (measured, 2026-10-14)
+- Ratio king: 12 strategies tried per file, smallest kept. Text 4.4%% vs
+  gzip-6 16.3%%; JSON 3.7%% vs 8.1%%; code 0.2%%; ramp 0.7%% (500 KB files).
+- Never claim PCC wins on speed: encode runs 0.26-24 MB/s; it is the
+  archival/bandwidth play.
+
+## Machine refs
+- /openapi.json — OpenAPI 3.0.3 spec
+- /.well-known/x402 — x402 route listing for indexers
+- /api/x402/prices — live price table
+- /llms.txt — this file
+""" % host
+
+
 def _well_known():
     """Body for /.well-known/x402 — picked up by x402 indexers."""
     eps = {}
@@ -1387,6 +1543,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _send_text(self, code, text, content_type, head_only=False):
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "%s; charset=utf-8" % content_type)
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
@@ -1423,15 +1588,28 @@ class Handler(BaseHTTPRequestHandler):
 
     def _route_get(self, head_only=False):
         p = self._path()
+        host = self.headers.get("Host", "rider-x402.fly.dev")
         if p == "/":
-            eps = ["/api/x402/%s/%s (%d¢)" % (pr, op, c)
+            if _accepts_html(self.headers):
+                # Browser (or any client asking for HTML) gets the human
+                # landing page. Machine clients keep the JSON below.
+                return self._send_text(200, _landing_html(host), "text/html",
+                                       head_only=head_only)
+            eps = ["api/x402/%s/%s (%d¢)" % (pr, op, c)
                    for pr, ops in PRODUCTS.items() for op, c in ops.items()]
             return self._send(200, {"service": "rider-x402",
                                     "x402Version": X402_VERSION,
                                     "networks": _rail_info(),
                                     "endpoints": eps,
-                                    "usage": "POST an endpoint; unpaid -> 402 with terms"},
+                                    "usage": "POST an endpoint; unpaid -> 402 with terms",
+                                    "openapi": "https://%s/openapi.json" % host},
                               head_only=head_only)
+        if p == "/robots.txt":
+            return self._send_text(200, _robots_txt(host), "text/plain",
+                                   head_only=head_only)
+        if p == "/llms.txt":
+            return self._send_text(200, _llms_txt(host), "text/plain",
+                                   head_only=head_only)
         if p == "/health":
             return self._send(200, {"ok": True, "ts": int(time.time())},
                               head_only=head_only)
